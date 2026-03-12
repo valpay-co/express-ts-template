@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CI/CD Pipeline for My App with ECS Blue-Green Deployment'
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: your-org
+    Description: GitHub repository owner
+  
+  GitHubRepo:
+    Type: String
+    Default: my-app
+    Description: GitHub repository name
+  
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub repository branch
+  
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of the GitHub connection in AWS CodeStar
+  
+  ApplicationStackName:
+    Type: String
+    Default: my-app
+    Description: Name of the CloudFormation stack for the application
+  
+  ECSClusterName:
+    Type: String
+    Default: my-app-cluster
+    Description: Name of the ECS cluster
+  
+  ECSServiceName:
+    Type: String
+    Default: my-app-service
+    Description: Name of the ECS service
+  
+  CreateCodeDeployApp:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the CodeDeploy application
+  
+  CreateUiBucket:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the UI bucket (set to false if it already exists)
+    
+  CreateCloudFrontDistributions:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create CloudFront distributions
+
+  ProdListenerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the production listener (auto-resolved from infra stack if empty)
+
+  TestListenerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the test listener (auto-resolved from infra stack if empty)
+
+  UIBucketName:
+    Type: String
+    Default: my-app-pipeline-ui
+    Description: S3 bucket name for UI assets
+
+  ContainerName:
+    Type: String
+    Default: my-app
+    Description: Container name in task definition
+
+  TaskDefinitionFamily:
+    Type: String
+    Default: my-app
+    Description: Task definition family name
+
+  EcsTaskRoleName:
+    Type: String
+    Default: ecsTaskRole
+    Description: Name of the ECS task role
+
+  EcsTaskExecutionRoleName:
+    Type: String
+    Default: ecsTaskExecutionRole
+    Description: Name of the ECS task execution role
+
+  LogGroupName:
+    Type: String
+    Default: /ecs/my-app
+    Description: CloudWatch log group name
+
+  MongoDBUri:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: MongoDB connection URI (if empty, uses default from template)
+
+  CloudFrontDistributionId:
+    Type: String
+    Default: ''
+    Description: CloudFront distribution ID for cache invalidation (if set, used directly)
+
+  CloudFrontLookupAlias:
+    Type: String
+    Default: app.example.com
+    Description: CloudFront alias to look up distribution ID (fallback when CloudFrontDistributionId is empty)
+
+  IamRolePrefix:
+    Type: String
+    Default: ''
+    Description: Prefix for IAM role names in the infra stack (e.g. rc -> rc-ecsTaskRole)
+
+  CloudFrontAlias:
+    Type: String
+    Default: app.example.com
+    Description: Custom domain alias for CloudFront in the infra stack
+
+Conditions:
+  ShouldCreateCodeDeployApp: !Equals [!Ref CreateCodeDeployApp, 'true']
+  ShouldCreateUiBucket: !Equals [!Ref CreateUiBucket, 'true']
+  ShouldCreateCloudFront: !Equals [!Ref CreateCloudFrontDistributions, 'true']
+
+Resources:
+  # S3 bucket for CodePipeline artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            ExpirationInDays: 30
+    DeletionPolicy: Retain
+
+  # S3 bucket for UI deployment
+  UiBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateUiBucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-ui
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # Bucket policy to allow public read access
+  UiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateUiBucket
+    Properties:
+      Bucket: !Ref UIBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${UIBucketName}/*'
+
+  # CodeBuild role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+
+  # CodeBuild policy
+  CodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeBuildPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListStackResources
+              - cloudformation:ValidateTemplate
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+            Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+          - Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:PassRole
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:UpdateRole
+              - iam:UpdateRoleDescription
+              - iam:UpdateAssumeRolePolicy
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/${EcsTaskRoleName}
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/${EcsTaskExecutionRoleName}
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/CodeDeployServiceRole
+          - Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:CreateService
+              - ecs:UpdateService
+              - ecs:RegisterTaskDefinition
+              - ecs:DescribeTaskDefinition
+              - ecs:ListTaskDefinitions
+              - ecs:DescribeTasks
+              - ecs:ListTasks
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:DescribeListeners
+              - elasticloadbalancing:ModifyListener
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - codedeploy:CreateApplication
+              - codedeploy:CreateDeploymentGroup
+              - codedeploy:CreateDeployment
+              - codedeploy:GetDeployment
+              - codedeploy:GetDeploymentConfig
+              - codedeploy:RegisterApplicationRevision
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+              - cloudfront:GetInvalidation
+              - cloudfront:ListInvalidations
+              - cloudfront:ListDistributions
+            Resource: '*'
+      Roles:
+        - !Ref CodeBuildServiceRole
+
+  # CodeBuild project for building the Docker image
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      Description: Build the My App Docker image
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Cache:
+        Type: NO_CACHE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/my-app
+          - Name: UI_BUCKET_NAME
+            Value: !Ref UIBucketName
+          - Name: CREATE_UI_BUCKET
+            Value: !Ref CreateUiBucket
+          - Name: CREATE_CLOUDFRONT_DISTRIBUTIONS
+            Value: !Ref CreateCloudFrontDistributions
+          - Name: STACK_NAME
+            Value: !Ref ApplicationStackName
+          - Name: CONTAINER_NAME
+            Value: !Ref ContainerName
+          - Name: TASK_DEF_FAMILY
+            Value: !Ref TaskDefinitionFamily
+          - Name: ECS_TASK_ROLE_NAME
+            Value: !Ref EcsTaskRoleName
+          - Name: ECS_TASK_EXECUTION_ROLE_NAME
+            Value: !Ref EcsTaskExecutionRoleName
+          - Name: LOG_GROUP_NAME
+            Value: !Ref LogGroupName
+          - Name: MONGODB_URI
+            Value: !Ref MongoDBUri
+          - Name: CLOUDFRONT_DISTRIBUTION_ID
+            Value: !Ref CloudFrontDistributionId
+          - Name: CLOUDFRONT_LOOKUP_ALIAS
+            Value: !Ref CloudFrontLookupAlias
+          - Name: ECS_CLUSTER_NAME
+            Value: !Ref ECSClusterName
+          - Name: ECS_SERVICE_NAME
+            Value: !Ref ECSServiceName
+          - Name: IAM_ROLE_PREFIX
+            Value: !Ref IamRolePrefix
+          - Name: CLOUDFRONT_ALIAS
+            Value: !Ref CloudFrontAlias
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=${COMMIT_HASH:=latest}
+                - echo Running regression tests...
+                - npm ci
+                - npm test
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $ECR_REPOSITORY_URI:latest .
+                - docker tag $ECR_REPOSITORY_URI:latest $ECR_REPOSITORY_URI:$IMAGE_TAG
+                - echo Building the UI...
+                - cd client
+                - npm ci --legacy-peer-deps
+                - echo "Environment file being used for Vite build:"
+                - cat .env.production
+                - npm run build
+                - cd ..
+            post_build:
+              commands:
+                - echo "Post-build phase started..."
+                - ls -la
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $ECR_REPOSITORY_URI:latest
+                - docker push $ECR_REPOSITORY_URI:$IMAGE_TAG
+                - echo "Writing imageDetail.json file for blue/green deployment..."
+                - printf '{"ImageURI":"%s"}' "$ECR_REPOSITORY_URI:$IMAGE_TAG" > imageDetail.json
+                - cat imageDetail.json
+                - echo "Updating CloudFormation stack for infrastructure changes..."
+                - |
+                  # Deploy CloudFormation stack without trying to update the task definition
+                  # The task definition is hard-coded in the CloudFormation template
+                  # All task definition updates will be handled by CodeDeploy
+                  PARAM_OVERRIDES="ProjectName=$STACK_NAME SkipECRCreation=true CreateCodeDeployApp=false"
+                  PARAM_OVERRIDES="$PARAM_OVERRIDES CreateCloudFrontDistributions=false"
+                  PARAM_OVERRIDES="$PARAM_OVERRIDES KeepExistingCloudFront=true CreateUIBucket=false"
+                  PARAM_OVERRIDES="$PARAM_OVERRIDES UIBucketName=$UI_BUCKET_NAME"
+                  if [ -n "$IAM_ROLE_PREFIX" ]; then
+                    PARAM_OVERRIDES="$PARAM_OVERRIDES IamRolePrefix=$IAM_ROLE_PREFIX"
+                  fi
+                  if [ -n "$CLOUDFRONT_ALIAS" ]; then
+                    PARAM_OVERRIDES="$PARAM_OVERRIDES CloudFrontAlias=$CLOUDFRONT_ALIAS"
+                  fi
+                  aws cloudformation deploy \
+                    --template-file infra/aws/cloudformation.yaml \
+                    --stack-name $STACK_NAME \
+                    --parameter-overrides $PARAM_OVERRIDES \
+                    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                    --no-fail-on-empty-changeset || echo "WARNING: CloudFormation deploy failed (non-fatal). Check stack events for details."
+                  
+                  # Alternative approach using deploy.sh script (commented out due to execution issues in CodeBuild)
+                  # cd infra/aws && chmod +x deploy.sh && ./deploy.sh \
+                  #   --project-name my-app \
+                  #   --skip-ecr \
+                  #   --skip-codedeploy-app \
+                  #   --skip-cloudfront \
+                  #   --keep-existing-cloudfront true \
+                  #   --force
+                - echo "Writing task definition file..."
+                - |
+                  cat > taskdef.json << EOF
+                  {
+                    "family": "$TASK_DEF_FAMILY",
+                    "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/$ECS_TASK_EXECUTION_ROLE_NAME",
+                    "taskRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/$ECS_TASK_ROLE_NAME",
+                    "networkMode": "awsvpc",
+                    "containerDefinitions": [
+                      {
+                        "name": "$CONTAINER_NAME",
+                        "image": "<IMAGE1_NAME>",
+                        "essential": true,
+                        "portMappings": [
+                          {
+                            "containerPort": 3000,
+                            "hostPort": 3000,
+                            "protocol": "tcp"
+                          }
+                        ],
+                        "environment": [
+                          {
+                            "name": "NODE_ENV",
+                            "value": "production"
+                          },
+                          {
+                            "name": "PORT",
+                            "value": "3000"
+                          },
+                          {
+                            "name": "MONGODB_URI",
+                            "value": "$MONGODB_URI"
+                          }
+                        ],
+                        "logConfiguration": {
+                          "logDriver": "awslogs",
+                          "options": {
+                            "awslogs-group": "$LOG_GROUP_NAME",
+                            "awslogs-region": "${AWS_REGION}",
+                            "awslogs-stream-prefix": "ecs"
+                          }
+                        }
+                      }
+                    ],
+                    "requiresCompatibilities": [
+                      "FARGATE"
+                    ],
+                    "cpu": "256",
+                    "memory": "512"
+                  }
+                  EOF
+                - |
+                  cat > appspec.yaml << EOF
+                  version: 0.0
+                  Resources:
+                    - TargetService:
+                        Type: AWS::ECS::Service
+                        Properties:
+                          TaskDefinition: "<TASK_DEFINITION>"
+                          LoadBalancerInfo:
+                            ContainerName: "$CONTAINER_NAME"
+                            ContainerPort: 3000
+                          PlatformVersion: "LATEST"
+                  EOF
+                - echo "Deploying UI to S3 bucket..."
+                - |
+                  if [ "$CREATE_UI_BUCKET" = "true" ] || aws s3 ls "s3://$UI_BUCKET_NAME" 2>/dev/null; then
+                    echo "Syncing UI files to S3..."
+                    aws s3 sync client/dist/ s3://$UI_BUCKET_NAME/ --delete
+                  else
+                    echo "UI bucket $UI_BUCKET_NAME does not exist, skipping S3 sync"
+                  fi
+                - echo "Creating CloudFront invalidation to clear cache..."
+                - |
+                  if [ ! -z "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
+                    CLOUDFRONT_ID="$CLOUDFRONT_DISTRIBUTION_ID"
+                  elif [ ! -z "$CLOUDFRONT_LOOKUP_ALIAS" ]; then
+                    CLOUDFRONT_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?Aliases.Items!=null] | [?contains(Aliases.Items, '$CLOUDFRONT_LOOKUP_ALIAS')].Id" --output text)
+                  else
+                    CLOUDFRONT_ID=""
+                  fi
+                  if [ ! -z "$CLOUDFRONT_ID" ]; then aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_ID --paths "/*"; fi
+                - echo "UI deployment completed"
+          artifacts:
+            files:
+              - appspec.yaml
+              - taskdef.json
+              - imageDetail.json
+            discard-paths: no
+
+  # CodePipeline role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+
+  # CodePipeline policy
+  CodePipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodePipelinePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+            Resource: !GetAtt CodeBuildProject.Arn
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DeleteStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ValidateTemplate
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - codedeploy:CreateDeployment
+              - codedeploy:GetDeployment
+              - codedeploy:GetApplication
+              - codedeploy:GetApplicationRevision
+              - codedeploy:RegisterApplicationRevision
+              - codedeploy:GetDeploymentConfig
+              - codedeploy:GetDeploymentTarget
+              - codedeploy:ListDeploymentTargets
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - codestar-connections:UseConnection
+            Resource: !Ref GitHubConnectionArn
+      Roles:
+        - !Ref CodePipelineServiceRole
+
+  # CloudFormation role for pipeline
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # CodeDeploy Service Role
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  # Additional permissions for CodeDeploy to access S3 artifacts
+  CodeDeployS3AccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployS3AccessPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !Sub ${ArtifactBucket.Arn}
+              - !Sub ${ArtifactBucket.Arn}/*
+      Roles:
+        - !Ref CodeDeployServiceRole
+
+  # CodeDeploy resources
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Condition: ShouldCreateCodeDeployApp
+    Properties:
+      ApplicationName: !Sub ${ApplicationStackName}-app
+      ComputePlatform: ECS
+
+  # CodeDeploy Deployment Group
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !If 
+        - ShouldCreateCodeDeployApp
+        - !Ref CodeDeployApplication
+        - !Sub "${ApplicationStackName}-app"
+      DeploymentGroupName: !Sub ${ApplicationStackName}-dg
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      ECSServices:
+        - ClusterName: !Ref ECSClusterName
+          ServiceName: !Ref ECSServiceName
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProdListenerArn
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListenerArn
+            TargetGroups:
+              - Name: !Sub ${ApplicationStackName}-prod-tg
+              - Name: !Sub ${ApplicationStackName}-test-tg
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+          WaitTimeInMinutes: 0
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref GitHubBranch
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceCode
+        - Name: Build
+          Actions:
+            - Name: BuildAndPushImage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployToECS
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeployToECS
+                Version: '1'
+              Configuration:
+                ApplicationName: !Sub ${ApplicationStackName}-app
+                DeploymentGroupName: !Sub ${ApplicationStackName}-dg
+                TaskDefinitionTemplateArtifact: BuildOutput
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BuildOutput
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: BuildOutput
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  ArtifactBucket:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref ArtifactBucket
+  PipelineURL:
+    Description: URL to the CodePipeline console
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+  UiWebsiteURL:
+    Condition: ShouldCreateUiBucket
+    Description: URL to the S3 website hosting the UI
+    Value: !GetAtt UiBucket.WebsiteURL

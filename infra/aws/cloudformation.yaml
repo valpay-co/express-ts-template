@@ -1,0 +1,690 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'My App Infrastructure with ECS and Blue-Green Deployment Support'
+
+Parameters:
+  # Project name used for resource naming
+  ProjectName:
+    Type: String
+    Default: my-app
+    Description: Name of the project
+    
+  # Skip ECR repository creation (useful for updates)
+  SkipECRCreation:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Skip ECR repository creation
+    
+  # Create CodeDeploy application (useful for updates)
+  CreateCodeDeployApp:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create CodeDeploy application
+    
+  # Create CloudFront distributions
+  CreateCloudFrontDistributions:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create CloudFront distributions for API and UI
+    
+  # Keep existing CloudFront distributions
+  KeepExistingCloudFront:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Keep existing CloudFront distributions even when CreateCloudFrontDistributions is false
+    
+  # Create UI Bucket
+  CreateUIBucket:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the UI bucket (set to false if it already exists)
+    
+  # Existing task definition ARN (for updates)
+  ExistingTaskDefinitionArn:
+    Type: String
+    Default: ''
+    Description: ARN of an existing task definition to use (leave empty to create a new one)
+    
+  VpcId:
+    Description: ID of the existing VPC with Atlas peering connection
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-XXXXXXXXX
+  
+  SubnetIds:
+    Description: Comma-separated list of subnet IDs to deploy the ECS tasks and load balancer
+    Type: CommaDelimitedList
+    Default: subnet-XXXXXXXXX,subnet-YYYYYYYYY
+  
+  ContainerPort:
+    Description: Port exposed by the container
+    Type: Number
+    Default: 3000
+  
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: Number of tasks to run
+  
+  TaskCpu:
+    Description: CPU units for the task (1 vCPU = 1024 CPU units)
+    Type: Number
+    Default: 256
+  
+  TaskMemory:
+    Description: Memory for the task in MiB
+    Type: Number
+    Default: 512
+  
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ARN of the ACM certificate for app.example.com domain
+
+  IamRolePrefix:
+    Type: String
+    Default: ''
+    Description: Prefix for IAM role names (e.g. rc -> rc-ecsTaskRole). Empty keeps current names.
+
+  UIBucketName:
+    Type: String
+    Default: my-app-pipeline-ui
+    Description: S3 bucket name for UI assets
+
+  InitialTaskDefinition:
+    Type: String
+    Default: 'my-app:14'
+    Description: Initial task definition for ECS service (e.g. my-app:14)
+
+  CloudFrontAlias:
+    Type: String
+    Default: app.example.com
+    Description: Custom domain alias for CloudFront. Empty uses CloudFront default domain only.
+
+Conditions:
+  CreateECRRepository: !Equals [!Ref SkipECRCreation, 'false']
+  CreateNewTaskDefinition: !Equals [!Ref ExistingTaskDefinitionArn, '']
+  ShouldCreateCodeDeployApp: !Equals [!Ref CreateCodeDeployApp, 'true']
+  ShouldCreateCloudFrontDistributions: !Equals [!Ref CreateCloudFrontDistributions, 'true']
+  ShouldCreateUIBucket: !Equals [!Ref CreateUIBucket, 'true']
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  HasCloudFrontWithCert: !And
+    - !Equals [!Ref CreateCloudFrontDistributions, 'true']
+    - !Not [!Equals [!Ref CertificateArn, '']]
+  ShouldCreateNewCloudFront: !Equals [!Ref CreateCloudFrontDistributions, 'true']
+  ShouldKeepCloudFront: !Equals [!Ref KeepExistingCloudFront, 'true']
+  HasIamRolePrefix: !Not [!Equals [!Ref IamRolePrefix, '']]
+  HasCloudFrontAlias: !Not [!Equals [!Ref CloudFrontAlias, '']]
+
+Resources:
+  # IAM Roles for ECS Tasks
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If [HasIamRolePrefix, !Sub '${IamRolePrefix}-ecsTaskRole', 'ecsTaskRole']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Path: /
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If [HasIamRolePrefix, !Sub '${IamRolePrefix}-ecsTaskExecutionRole', 'ecsTaskExecutionRole']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Path: /
+
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Condition: CreateECRRepository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # Security Group for ECS Tasks
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ${ProjectName} ECS tasks'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: 0.0.0.0/0
+
+  # Load Balancer Security Group
+  LBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ${ProjectName} load balancer'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # Task Execution Role
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Task Role
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 30
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Condition: CreateNewTaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ProjectName
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: !Ref ContainerPort
+            - Name: MONGODB_URI
+              Value: YOUR_MONGODB_URI
+
+  # Internet-Facing Load Balancer
+  InternetLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-lb'
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !GetAtt LBSecurityGroup.GroupId
+      Type: application
+
+  # Production Target Group
+  ProdTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-prod-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: '/api/health'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  # Test Target Group for Blue-Green Deployment
+  TestTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-test-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: '/api/health'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  # Production Listener
+  ProdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProdTargetGroup
+      LoadBalancerArn: !Ref InternetLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Test Listener for Blue-Green Deployment
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TestTargetGroup
+      LoadBalancerArn: !Ref InternetLoadBalancer
+      Port: 8080
+      Protocol: HTTP
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    DependsOn:
+      - ProdListener
+      - TestListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-service'
+      Cluster: !Ref ECSCluster
+      # Hard-code the task definition ARN to prevent CloudFormation from updating it
+      # All task definition updates should be handled by CodeDeploy
+      TaskDefinition: !Ref InitialTaskDefinition
+      LaunchType: FARGATE
+      # Set DesiredCount to 0 for blue-green deployments
+      # CodeDeploy will manage task creation during deployment
+      DesiredCount: 0
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: !Sub '${ProjectName}'
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ProdTargetGroup
+      # Use CODE_DEPLOY deployment controller for blue-green deployments
+      # This means task definition updates must be done through CodeDeploy
+      DeploymentController:
+        Type: CODE_DEPLOY
+      Tags:
+        - Key: UpdatedAt
+          Value: !Ref AWS::AccountId
+
+  # Application Auto Scaling for ECS Service
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 1
+      ResourceId: !Join 
+        - '/'
+        - - service
+          - !Ref ECSCluster
+          - !GetAtt ECSService.Name
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  # Auto Scaling Policy based on CPU utilization
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-cpu-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # IAM Role for Auto Scaling
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  # CodeDeploy Application
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Condition: ShouldCreateCodeDeployApp
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-app'
+      ComputePlatform: ECS
+
+  # CodeDeploy Deployment Group
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: ShouldCreateCodeDeployApp
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ProjectName}-dg'
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      ECSServices:
+        - ClusterName: !Ref ECSCluster
+          ServiceName: !GetAtt ECSService.Name
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProdListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListener
+            TargetGroups:
+              - Name: !GetAtt ProdTargetGroup.TargetGroupName
+              - Name: !GetAtt TestTargetGroup.TargetGroupName
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+          WaitTimeInMinutes: 0
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+
+  # CodeDeploy Service Role
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  # CloudFront Origin Access Identity for S3
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Condition: ShouldCreateCloudFrontDistributions
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName} UI'
+
+  # S3 Bucket for UI
+  UIBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateUIBucket
+    Properties:
+      BucketName: !Ref UIBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  # Combined CloudFront Distribution for both API and UI
+  CombinedDistribution:
+    Type: AWS::CloudFront::Distribution
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Condition: ShouldCreateNewCloudFront
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} Combined Distribution'
+        Aliases: !If [HasCloudFrontAlias, [!Ref CloudFrontAlias], !Ref "AWS::NoValue"]
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ApiOrigin
+            DomainName: !GetAtt InternetLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+          - !If
+            - ShouldCreateUIBucket
+            - Id: UiOrigin
+              DomainName: !Sub '${UIBucket}.s3-website-${AWS::Region}.amazonaws.com'
+              CustomOriginConfig:
+                HTTPPort: 80
+                HTTPSPort: 443
+                OriginProtocolPolicy: http-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+                OriginReadTimeout: 30
+                OriginKeepaliveTimeout: 5
+            - Id: UiOrigin
+              DomainName: !Sub '${UIBucketName}.s3-website-${AWS::Region}.amazonaws.com'
+              CustomOriginConfig:
+                HTTPPort: 80
+                HTTPSPort: 443
+                OriginProtocolPolicy: http-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+                OriginReadTimeout: 30
+                OriginKeepaliveTimeout: 5
+        DefaultCacheBehavior:
+          TargetOriginId: UiOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: '/api*'
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: all
+              Headers:
+                - Authorization
+                - Origin
+                - Access-Control-Request-Method
+                - Access-Control-Request-Headers
+            Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponsePagePath: /index.html
+            ResponseCode: 200
+            ErrorCachingMinTTL: 300
+        ViewerCertificate: !If
+          - HasCloudFrontAlias
+          - AcmCertificateArn: !If [HasCertificate, !Ref CertificateArn, !Ref "AWS::NoValue"]
+            MinimumProtocolVersion: TLSv1.2_2021
+            SslSupportMethod: !If [HasCertificate, "sni-only", "vip"]
+            CloudFrontDefaultCertificate: !If [HasCertificate, !Ref "AWS::NoValue", true]
+          - CloudFrontDefaultCertificate: true
+
+  # S3 Bucket Policy for CloudFront Access
+  S3BucketPolicyForCloudFront:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateUIBucket
+    Properties:
+      Bucket: !Ref UIBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${UIBucket}/*'
+
+Outputs:
+  ECRRepositoryUri:
+    Description: URI of the ECR repository
+    Value: !If
+      - CreateECRRepository
+      - !GetAtt ECRRepository.RepositoryUri
+      - !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}'
+
+  LoadBalancerDNS:
+    Description: DNS name of the load balancer
+    Value: !GetAtt InternetLoadBalancer.DNSName
+
+  ECSCluster:
+    Description: ECS Cluster
+    Value: !Ref ECSCluster
+    
+  ECSService:
+    Description: ECS Service
+    Value: !Ref ECSService
+    
+  TaskDefinition:
+    Description: Task Definition
+    Condition: CreateNewTaskDefinition
+    Value: !Ref TaskDefinition
+    
+  CodeDeployApplication:
+    Description: CodeDeploy Application
+    Condition: ShouldCreateCodeDeployApp
+    Value: !Ref CodeDeployApplication
+    
+  CodeDeployDeploymentGroup:
+    Description: CodeDeploy Deployment Group
+    Condition: ShouldCreateCodeDeployApp
+    Value: !Ref CodeDeployDeploymentGroup
+    
+  CombinedDistributionId:
+    Description: ID of the combined CloudFront distribution
+    Condition: ShouldCreateNewCloudFront
+    Value: !Ref CombinedDistribution
+    
+  CombinedDistributionDomainName:
+    Description: Domain name of the combined CloudFront distribution
+    Condition: ShouldCreateNewCloudFront
+    Value: !GetAtt CombinedDistribution.DomainName
+
+  ProdListenerArn:
+    Description: ARN of the production listener
+    Value: !Ref ProdListener
+
+  TestListenerArn:
+    Description: ARN of the test listener
+    Value: !Ref TestListener
