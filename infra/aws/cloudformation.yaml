@@ -7,7 +7,7 @@ Parameters:
     Type: String
     Default: my-app
     Description: Name of the project
-    
+
   # Skip ECR repository creation (useful for updates)
   SkipECRCreation:
     Type: String
@@ -16,7 +16,7 @@ Parameters:
       - 'true'
       - 'false'
     Description: Skip ECR repository creation
-    
+
   # Create CodeDeploy application (useful for updates)
   CreateCodeDeployApp:
     Type: String
@@ -25,7 +25,7 @@ Parameters:
       - 'true'
       - 'false'
     Description: Create CodeDeploy application
-    
+
   # Create CloudFront distributions
   CreateCloudFrontDistributions:
     Type: String
@@ -34,7 +34,7 @@ Parameters:
       - 'true'
       - 'false'
     Description: Create CloudFront distributions for API and UI
-    
+
   # Keep existing CloudFront distributions
   KeepExistingCloudFront:
     Type: String
@@ -43,7 +43,7 @@ Parameters:
       - 'true'
       - 'false'
     Description: Keep existing CloudFront distributions even when CreateCloudFrontDistributions is false
-    
+
   # Create UI Bucket
   CreateUIBucket:
     Type: String
@@ -52,67 +52,56 @@ Parameters:
       - 'true'
       - 'false'
     Description: Whether to create the UI bucket (set to false if it already exists)
-    
+
   # Existing task definition ARN (for updates)
   ExistingTaskDefinitionArn:
     Type: String
     Default: ''
     Description: ARN of an existing task definition to use (leave empty to create a new one)
-    
+
+  # Create optional scheduled task infrastructure (EventBridge + CloudWatch + SNS)
+  CreateScheduledTask:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create EventBridge scheduled task, CloudWatch alarm, and SNS failure topic
+
   VpcId:
-    Description: ID of the existing VPC with Atlas peering connection
+    Description: ID of the existing VPC
     Type: AWS::EC2::VPC::Id
     Default: vpc-XXXXXXXXX
-  
+
   SubnetIds:
     Description: Comma-separated list of subnet IDs to deploy the ECS tasks and load balancer
     Type: CommaDelimitedList
     Default: subnet-XXXXXXXXX,subnet-YYYYYYYYY
-  
+
   ContainerPort:
     Description: Port exposed by the container
     Type: Number
     Default: 3000
-  
+
   DesiredCount:
     Type: Number
     Default: 1
     Description: Number of tasks to run
-  
+
   TaskCpu:
     Description: CPU units for the task (1 vCPU = 1024 CPU units)
     Type: Number
     Default: 256
-  
+
   TaskMemory:
     Description: Memory for the task in MiB
     Type: Number
     Default: 512
-  
+
   CertificateArn:
     Type: String
     Default: ''
-    Description: ARN of the ACM certificate for app.example.com domain
-
-  IamRolePrefix:
-    Type: String
-    Default: ''
-    Description: Prefix for IAM role names (e.g. rc -> rc-ecsTaskRole). Empty keeps current names.
-
-  UIBucketName:
-    Type: String
-    Default: my-app-pipeline-ui
-    Description: S3 bucket name for UI assets
-
-  InitialTaskDefinition:
-    Type: String
-    Default: 'my-app:14'
-    Description: Initial task definition for ECS service (e.g. my-app:14)
-
-  CloudFrontAlias:
-    Type: String
-    Default: app.example.com
-    Description: Custom domain alias for CloudFront. Empty uses CloudFront default domain only.
+    Description: ARN of the ACM certificate for the custom domain (optional)
 
 Conditions:
   CreateECRRepository: !Equals [!Ref SkipECRCreation, 'false']
@@ -126,15 +115,14 @@ Conditions:
     - !Not [!Equals [!Ref CertificateArn, '']]
   ShouldCreateNewCloudFront: !Equals [!Ref CreateCloudFrontDistributions, 'true']
   ShouldKeepCloudFront: !Equals [!Ref KeepExistingCloudFront, 'true']
-  HasIamRolePrefix: !Not [!Equals [!Ref IamRolePrefix, '']]
-  HasCloudFrontAlias: !Not [!Equals [!Ref CloudFrontAlias, '']]
+  HasScheduledTask: !Equals [!Ref CreateScheduledTask, 'true']
 
 Resources:
   # IAM Roles for ECS Tasks
   ECSTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !If [HasIamRolePrefix, !Sub '${IamRolePrefix}-ecsTaskRole', 'ecsTaskRole']
+      RoleName: !Sub '${ProjectName}-ecsTaskRole'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -149,7 +137,7 @@ Resources:
   ECSTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !If [HasIamRolePrefix, !Sub '${IamRolePrefix}-ecsTaskExecutionRole', 'ecsTaskExecutionRole']
+      RoleName: !Sub '${ProjectName}-ecsTaskExecutionRole'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -159,6 +147,18 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ParameterStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
       Path: /
 
   # ECR Repository
@@ -223,34 +223,6 @@ Resources:
         - CapacityProvider: FARGATE
           Weight: 1
 
-  # Task Execution Role
-  TaskExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-  # Task Role
-  TaskRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-
   # CloudWatch Log Group
   LogGroup:
     Type: AWS::Logs::LogGroup
@@ -291,7 +263,7 @@ Resources:
             - Name: NODE_ENV
               Value: production
             - Name: PORT
-              Value: !Ref ContainerPort
+              Value: !Sub '${ContainerPort}'
             - Name: MONGODB_URI
               Value: YOUR_MONGODB_URI
 
@@ -315,7 +287,7 @@ Resources:
       Protocol: HTTP
       TargetType: ip
       VpcId: !Ref VpcId
-      HealthCheckPath: '/api/health'
+      HealthCheckPath: '/health'
       HealthCheckIntervalSeconds: 30
       HealthCheckTimeoutSeconds: 5
       HealthyThresholdCount: 2
@@ -330,7 +302,7 @@ Resources:
       Protocol: HTTP
       TargetType: ip
       VpcId: !Ref VpcId
-      HealthCheckPath: '/api/health'
+      HealthCheckPath: '/health'
       HealthCheckIntervalSeconds: 30
       HealthCheckTimeoutSeconds: 5
       HealthyThresholdCount: 2
@@ -369,12 +341,10 @@ Resources:
     Properties:
       ServiceName: !Sub '${ProjectName}-service'
       Cluster: !Ref ECSCluster
-      # Hard-code the task definition ARN to prevent CloudFormation from updating it
+      # Hard-code the task definition to prevent CloudFormation from updating it
       # All task definition updates should be handled by CodeDeploy
-      TaskDefinition: !Ref InitialTaskDefinition
+      TaskDefinition: !Sub '${ProjectName}:1'
       LaunchType: FARGATE
-      # Set DesiredCount to 0 for blue-green deployments
-      # CodeDeploy will manage task creation during deployment
       DesiredCount: 0
       DeploymentConfiguration:
         MaximumPercent: 200
@@ -389,8 +359,7 @@ Resources:
         - ContainerName: !Sub '${ProjectName}'
           ContainerPort: !Ref ContainerPort
           TargetGroupArn: !Ref ProdTargetGroup
-      # Use CODE_DEPLOY deployment controller for blue-green deployments
-      # This means task definition updates must be done through CodeDeploy
+      # CODE_DEPLOY controller — task definition updates must go through CodeDeploy
       DeploymentController:
         Type: CODE_DEPLOY
       Tags:
@@ -403,7 +372,7 @@ Resources:
     Properties:
       MaxCapacity: 4
       MinCapacity: 1
-      ResourceId: !Join 
+      ResourceId: !Join
         - '/'
         - - service
           - !Ref ECSCluster
@@ -425,6 +394,130 @@ Resources:
         TargetValue: 70.0
         ScaleInCooldown: 300
         ScaleOutCooldown: 60
+
+  # ─── Optional: Scheduled Task Infrastructure ──────────────────────────────
+
+  # Scheduled Task Definition (opt-in via CreateScheduledTask=true)
+  ScheduledTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasScheduledTask
+    Properties:
+      Family: !Sub '${ProjectName}-scheduled'
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: 512
+      Memory: 1024
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${ProjectName}-scheduled'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}:latest'
+          Essential: true
+          Command:
+            - npm
+            - run
+            - schedule
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ScheduledLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: scheduled
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+
+  # CloudWatch Log Group for Scheduled Tasks
+  ScheduledLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasScheduledTask
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-scheduled'
+      RetentionInDays: 30
+
+  # IAM Role for EventBridge to run ECS tasks
+  EventBridgeECSRole:
+    Type: AWS::IAM::Role
+    Condition: HasScheduledTask
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECSTaskExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref ScheduledTaskDefinition
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt ECSTaskExecutionRole.Arn
+                  - !GetAtt ECSTaskRole.Arn
+
+  # EventBridge Rule — weekly schedule (Monday 6 AM UTC by default; adjust as needed)
+  WeeklyScheduledRule:
+    Type: AWS::Events::Rule
+    Condition: HasScheduledTask
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-schedule'
+      Description: !Sub 'Trigger ${ProjectName} scheduled task every Monday at 6 AM UTC'
+      ScheduleExpression: 'cron(0 6 ? * MON *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ECSCluster.Arn
+          Id: !Sub '${ProjectName}-scheduled-target'
+          RoleArn: !GetAtt EventBridgeECSRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref ScheduledTaskDefinition
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                SecurityGroups:
+                  - !Ref ECSSecurityGroup
+                Subnets: !Ref SubnetIds
+
+  # CloudWatch Alarm for Failed Scheduled Tasks
+  ScheduledTaskFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasScheduledTask
+    Properties:
+      AlarmName: !Sub '${ProjectName}-scheduled-task-failure'
+      AlarmDescription: !Sub 'Alert when ${ProjectName} scheduled task fails'
+      MetricName: TasksStoppedReason
+      Namespace: AWS/ECS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !Sub '${ProjectName}-scheduled'
+      AlarmActions:
+        - !Ref ScheduledTaskFailureTopic
+
+  # SNS Topic for Scheduled Task Failure Notifications
+  ScheduledTaskFailureTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasScheduledTask
+    Properties:
+      TopicName: !Sub '${ProjectName}-scheduled-failures'
+      DisplayName: !Sub '${ProjectName} Scheduled Task Failures'
+
+  # ─── IAM Roles ────────────────────────────────────────────────────────────
 
   # IAM Role for Auto Scaling
   AutoScalingRole:
@@ -488,6 +581,7 @@ Resources:
   CodeDeployServiceRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${ProjectName}-CodeDeployServiceRole'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -497,6 +591,19 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+      Policies:
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-pipeline-artifactbucket-*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-pipeline-artifactbucket-*/*'
 
   # CloudFront Origin Access Identity for S3
   CloudFrontOriginAccessIdentity:
@@ -511,7 +618,8 @@ Resources:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateUIBucket
     Properties:
-      BucketName: !Ref UIBucketName
+      BucketName: !Sub '${ProjectName}-pipeline-ui'
+      AccessControl: PublicRead
       PublicAccessBlockConfiguration:
         BlockPublicAcls: false
         BlockPublicPolicy: false
@@ -530,7 +638,7 @@ Resources:
     Properties:
       DistributionConfig:
         Comment: !Sub '${ProjectName} Combined Distribution'
-        Aliases: !If [HasCloudFrontAlias, [!Ref CloudFrontAlias], !Ref "AWS::NoValue"]
+        Aliases: !If [HasCertificate, [!Sub '${ProjectName}.example.com'], !Ref "AWS::NoValue"]
         Enabled: true
         HttpVersion: http2
         PriceClass: PriceClass_100
@@ -548,7 +656,7 @@ Resources:
           - !If
             - ShouldCreateUIBucket
             - Id: UiOrigin
-              DomainName: !Sub '${UIBucket}.s3-website-${AWS::Region}.amazonaws.com'
+              DomainName: !Sub '${UIBucket.BucketName}.s3-website-${AWS::Region}.amazonaws.com'
               CustomOriginConfig:
                 HTTPPort: 80
                 HTTPSPort: 443
@@ -558,7 +666,7 @@ Resources:
                 OriginReadTimeout: 30
                 OriginKeepaliveTimeout: 5
             - Id: UiOrigin
-              DomainName: !Sub '${UIBucketName}.s3-website-${AWS::Region}.amazonaws.com'
+              DomainName: !Sub '${ProjectName}-pipeline-ui.s3-website-${AWS::Region}.amazonaws.com'
               CustomOriginConfig:
                 HTTPPort: 80
                 HTTPSPort: 443
@@ -614,13 +722,11 @@ Resources:
             ResponsePagePath: /index.html
             ResponseCode: 200
             ErrorCachingMinTTL: 300
-        ViewerCertificate: !If
-          - HasCloudFrontAlias
-          - AcmCertificateArn: !If [HasCertificate, !Ref CertificateArn, !Ref "AWS::NoValue"]
-            MinimumProtocolVersion: TLSv1.2_2021
-            SslSupportMethod: !If [HasCertificate, "sni-only", "vip"]
-            CloudFrontDefaultCertificate: !If [HasCertificate, !Ref "AWS::NoValue", true]
-          - CloudFrontDefaultCertificate: true
+        ViewerCertificate:
+          AcmCertificateArn: !If [HasCertificate, !Ref CertificateArn, !Ref "AWS::NoValue"]
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: !If [HasCertificate, "sni-only", "vip"]
+          CloudFrontDefaultCertificate: !If [HasCertificate, !Ref "AWS::NoValue", true]
 
   # S3 Bucket Policy for CloudFront Access
   S3BucketPolicyForCloudFront:
@@ -634,7 +740,7 @@ Resources:
           - Effect: Allow
             Principal: '*'
             Action: 's3:GetObject'
-            Resource: !Sub 'arn:aws:s3:::${UIBucket}/*'
+            Resource: !Sub 'arn:aws:s3:::${UIBucket.BucketName}/*'
 
 Outputs:
   ECRRepositoryUri:
@@ -651,40 +757,47 @@ Outputs:
   ECSCluster:
     Description: ECS Cluster
     Value: !Ref ECSCluster
-    
+
   ECSService:
     Description: ECS Service
     Value: !Ref ECSService
-    
+
   TaskDefinition:
     Description: Task Definition
     Condition: CreateNewTaskDefinition
     Value: !Ref TaskDefinition
-    
+
   CodeDeployApplication:
     Description: CodeDeploy Application
     Condition: ShouldCreateCodeDeployApp
     Value: !Ref CodeDeployApplication
-    
+
   CodeDeployDeploymentGroup:
     Description: CodeDeploy Deployment Group
     Condition: ShouldCreateCodeDeployApp
     Value: !Ref CodeDeployDeploymentGroup
-    
+
   CombinedDistributionId:
     Description: ID of the combined CloudFront distribution
     Condition: ShouldCreateNewCloudFront
     Value: !Ref CombinedDistribution
-    
+
   CombinedDistributionDomainName:
     Description: Domain name of the combined CloudFront distribution
     Condition: ShouldCreateNewCloudFront
     Value: !GetAtt CombinedDistribution.DomainName
 
-  ProdListenerArn:
-    Description: ARN of the production listener
-    Value: !Ref ProdListener
+  ScheduledTaskDefinition:
+    Description: Task Definition for scheduled task
+    Condition: HasScheduledTask
+    Value: !Ref ScheduledTaskDefinition
 
-  TestListenerArn:
-    Description: ARN of the test listener
-    Value: !Ref TestListener
+  WeeklyScheduledRule:
+    Description: EventBridge rule for weekly scheduled task
+    Condition: HasScheduledTask
+    Value: !Ref WeeklyScheduledRule
+
+  ScheduledTaskFailureTopic:
+    Description: SNS topic for scheduled task failure notifications
+    Condition: HasScheduledTask
+    Value: !Ref ScheduledTaskFailureTopic
